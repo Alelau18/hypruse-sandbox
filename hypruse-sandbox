@@ -122,26 +122,32 @@ def _hyprctl_ok(args: list[str], env: dict[str, str]) -> subprocess.CompletedPro
 def parent_env() -> dict[str, str]:
     """The human's session, as hyprctl and the nested compositor need it.
 
-    Filled from the filesystem when the caller has no session variables (an
-    MCP server spawned by a daemon), the way hypruse's own session discovery
-    does: the most recent live instance under $XDG_RUNTIME_DIR/hypr. Nested
-    sandboxes live elsewhere, so they are never candidates."""
+    Filled in when the caller has no session variables (an MCP server spawned
+    by a daemon) from `hyprctl instances`, which lists only instances whose
+    process is alive and names each one's Wayland socket, so the signature
+    and the socket always belong to the same compositor. A socket file in
+    $XDG_RUNTIME_DIR/hypr proves nothing: it outlives a crashed instance.
+    Nested sandboxes keep their sockets in their own runtime directories,
+    so they are never candidates."""
     env = dict(os.environ)
     env["XDG_RUNTIME_DIR"] = str(RUNTIME)
+    proc = _hyprctl_ok(["-j", "instances"], env)
+    try:
+        live = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        live = []
+    if not live:
+        raise SandboxError("no running Hyprland session found (hyprctl instances lists none)")
     sig = env.get("HYPRLAND_INSTANCE_SIGNATURE", "")
-    if not sig or not (RUNTIME / "hypr" / sig / ".socket.sock").exists():
-        live = [d for d in (RUNTIME / "hypr").glob("*") if (d / ".socket.sock").exists()]
-        if not live:
-            raise SandboxError("no running Hyprland session found under $XDG_RUNTIME_DIR/hypr")
-        sig = max(live, key=lambda d: d.stat().st_mtime).name
-        env["HYPRLAND_INSTANCE_SIGNATURE"] = sig
+    inst = next((i for i in live if i.get("instance") == sig), None)
+    if inst is None:
+        inst = max(live, key=lambda i: i.get("time", 0))
+        env["HYPRLAND_INSTANCE_SIGNATURE"] = inst["instance"]
+        env["WAYLAND_DISPLAY"] = inst.get("wl_socket", "")
+    elif not env.get("WAYLAND_DISPLAY"):
+        env["WAYLAND_DISPLAY"] = inst.get("wl_socket", "")
     if not env.get("WAYLAND_DISPLAY"):
-        proc = _hyprctl_ok(["-j", "instances"], env)
-        for inst in json.loads(proc.stdout or "[]"):
-            if inst.get("instance") == sig and inst.get("wl_socket"):
-                env["WAYLAND_DISPLAY"] = inst["wl_socket"]
-        if not env.get("WAYLAND_DISPLAY"):
-            raise SandboxError("cannot tell which Wayland socket the human's Hyprland owns")
+        raise SandboxError("cannot tell which Wayland socket the human's Hyprland owns")
     return env
 
 

@@ -1,0 +1,39 @@
+# Local build of the hypruse fork at ~/NewStuff/hypruse (branch agent-ergonomics):
+# upstream 0.13 plus the agent-ergonomics fixes, installed as `hypruse` so the MCP
+# config keeps pointing at /usr/bin/hypruse. An AUR upgrade to a newer upstream
+# release replaces it (pacman sees a higher version), dropping the fixes unless
+# they were merged upstream; rebuild from the rebased branch then.
+pkgname=hypruse
+pkgver=0.13.0
+pkgrel=1
+pkgdesc="Computer use for Hyprland (local fork: agent-ergonomics)"
+arch=('any')
+url="https://github.com/IlyasKhallouki/hypruse"
+license=('MIT')
+depends=('python' 'python-mcp' 'hyprland' 'grim' 'wtype')
+optdepends=('wl-clipboard: opt-in clipboard tool (HYPRUSE_CLIPBOARD=1)'
+            'imagemagick: numbered Set-of-Marks captures (marks tool)')
+makedepends=('git' 'python-build' 'python-installer' 'python-wheel' 'python-hatchling')
+source=("hypruse::git+file://$HOME/NewStuff/hypruse#branch=agent-ergonomics")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd hypruse
+  git describe --long --tags --abbrev=7 | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
+}
+
+build() {
+  cd hypruse
+  python -m build --wheel --no-isolation
+}
+
+check() {
+  cd hypruse
+  PYTHONPATH=src python -m pytest -q -p no:cacheprovider
+}
+
+package() {
+  cd hypruse
+  python -m installer --destdir="$pkgdir" dist/*.whl
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

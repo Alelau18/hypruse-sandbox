@@ -136,6 +136,50 @@ def test_parent_exec_reports_a_refusal(monkeypatch):
         hs.parent_exec("bad", "/x")
 
 
+INSTANCES = [
+    {"instance": "old_1", "time": 100, "pid": 1, "wl_socket": "wayland-2"},
+    {"instance": "new_2", "time": 200, "pid": 2, "wl_socket": "wayland-10"},
+]
+
+
+def _instances(monkeypatch, listing):
+    monkeypatch.setattr(
+        hs, "_hyprctl_ok",
+        lambda args, env: subprocess.CompletedProcess(args, 0, json.dumps(listing), ""),
+    )
+
+
+def test_parent_env_without_variables_takes_one_live_instance_whole(monkeypatch):
+    _instances(monkeypatch, INSTANCES)
+    monkeypatch.delenv("HYPRLAND_INSTANCE_SIGNATURE", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    env = hs.parent_env()
+    assert (env["HYPRLAND_INSTANCE_SIGNATURE"], env["WAYLAND_DISPLAY"]) == ("new_2", "wayland-10")
+
+
+def test_parent_env_replaces_a_dead_signature_and_its_socket(monkeypatch):
+    # a crashed instance leaves its socket file behind; only a live one counts
+    _instances(monkeypatch, INSTANCES)
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "crashed_0")
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-1")
+    env = hs.parent_env()
+    assert (env["HYPRLAND_INSTANCE_SIGNATURE"], env["WAYLAND_DISPLAY"]) == ("new_2", "wayland-10")
+
+
+def test_parent_env_keeps_a_live_signature(monkeypatch):
+    _instances(monkeypatch, INSTANCES)
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "old_1")
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    env = hs.parent_env()
+    assert (env["HYPRLAND_INSTANCE_SIGNATURE"], env["WAYLAND_DISPLAY"]) == ("old_1", "wayland-2")
+
+
+def test_parent_env_without_hyprland(monkeypatch):
+    _instances(monkeypatch, [])
+    with pytest.raises(hs.SandboxError, match="no running Hyprland"):
+        hs.parent_env()
+
+
 # --- processes --------------------------------------------------------------------
 
 
