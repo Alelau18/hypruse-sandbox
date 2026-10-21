@@ -72,11 +72,26 @@ NAME_RE = re.compile(r"^[a-z0-9]{1,4}$")
 SUN_PATH_MAX = 107
 # Hyprland's signature is <40 hex>_<unix time>_<random>, up to 63 characters
 SIG_MAX = 63
-START_TIMEOUT = 20.0
+START_TIMEOUT = 20.0  # for the compositor's sockets
+XWAYLAND_TIMEOUT = 5.0  # its display number is a convenience; going without is not fatal
+FRAME_TIMEOUT = 10.0
 ENV_DROP = (
     "WAYLAND_SOCKET", "DISPLAY", "AT_SPI_BUS_ADDRESS", "HL_INITIAL_WORKSPACE_TOKEN",
-    "XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID", "HYPRLAND_CMD", "SWAYSOCK", "I3SOCK",
+    "HL_EXEC_RULE_TOKEN", "XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID", "HYPRLAND_CMD",
+    "SWAYSOCK", "I3SOCK",
 )
+# The marker that makes a process the sandbox's, for `down`. Everything the tool
+# starts carries it (the compositor and so every app it launches, the bus and
+# what it activates, `run`), and `env` does not print it: a shell pointed at the
+# sandbox with `eval "$(hypruse-sandbox env)"` is the human's, never killed.
+MEMBER = "HUS_MEMBER"
+# Session services the private bus may start. The accessibility bus only: with
+# the stock service directories it would start a second dconf-service writing
+# the human's settings, a second kwalletd on the human's wallet, kded, and so on.
+# Without them an app falls back (its own file dialog, settings unsaved).
+BUS_SERVICES = ("org.a11y.Bus",)
+MCP_PREFIX = "m"  # MCP servers claim m1, m2, ...: never a name a human picked
+FAILED_START_CACHE = 15.0
 
 
 class SandboxError(RuntimeError):
@@ -180,7 +195,7 @@ def parent_exec(rules: str, command: str) -> None:
     The window rules (special workspace, silent, render_unfocused) only bind
     to the window of the process Hyprland spawned, so the nested compositor
     must be that process: nested.sh ends in `exec Hyprland`."""
-    line = f"[{rules}] {command}"
+    line = f"[{rules}] exec {shlex.quote(command)}"
     request = [f"hl.dsp.exec_cmd({lua_str(line)})"] if parent_is_lua() else ["exec", line]
     out = _hyprctl_ok(["dispatch", *request], parent_env())
     if out.stdout.strip() != "ok":
@@ -199,7 +214,15 @@ def parent_option(name: str) -> str:
     try:
         return str(json.loads(proc.stdout).get("str", ""))
     except (json.JSONDecodeError, AttributeError):
-        return ""
+        pass
+    # the Lua manager prints string options into its JSON unescaped, so a value
+    # with a quote breaks it; the plain reply has the value on a `str:` line
+    plain = _hyprctl_ok(["getoption", name], parent_env())
+    for line in plain.stdout.splitlines():
+        if line.strip().startswith("str:"):
+            return line.split(":", 1)[1].strip()
+    log(f"hypruse-sandbox: could not read {name} from the human's Hyprland; using the default")
+    return ""
 
 
 # --- one sandbox -----------------------------------------------------------------
@@ -215,6 +238,19 @@ class Sandbox:
     def bus(self) -> Path:
         return self.dir / "bus"
 
+    @property
+    def lock(self) -> Path:
+        # beside the state directory, never inside it: `down` removes the
+        # directory, and a lock file unlinked under a waiting `up` would let a
+        # third caller lock a fresh inode and start a second compositor
+        return RUNTIME / f"hus-{self.name}.lock"
+
+    def _make_dir(self) -> None:
+        # hypruse creates <dir>/hypruse itself when an MCP server starts before
+        # the sandbox, with the default mode: tighten whatever is there
+        self.dir.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(self.dir, 0o700)
+
     def _read(self, fname: str) -> str:
         try:
             return (self.dir / fname).read_text().strip()
@@ -227,7 +263,7 @@ class Sandbox:
 
     # -- the environment clients of the sandbox get --
 
-    def client_env(self, base: dict[str, str] | None = None) -> dict[str, str]:
+    def client_env(self, base: dict[str, str] | None = None, member: bool = True) -> dict[str, str]:
         env = dict(os.environ if base is None else base)
         for key in ENV_DROP:
             env.pop(key, None)
@@ -243,6 +279,8 @@ class Sandbox:
             # send apps to a hidden workspace inside it and type blind
             HYPRUSE_BACKGROUND="0",
         )
+        if member:
+            env[MEMBER] = self.name
         display = self._read("display")
         if display:
             env["DISPLAY"] = display
@@ -264,10 +302,21 @@ class Sandbox:
 
     def nested_pid(self) -> int | None:
         pid = self._pid("nested.pid")
-        return pid if pid and _owned_by(pid, self.dir) else None
+        return pid if pid and _is_member(pid, self) else None
 
     def running(self) -> bool:
         return self.nested_pid() is not None and self.ipc_alive()
+
+    def healthy(self) -> bool:
+        """Running AND still a window on the human's desktop. Closing that window
+        destroys the nested compositor's only output; Hyprland carries on with a
+        fallback output nothing renders to, so it is restarted, not reused."""
+        if not self.running():
+            return False
+        try:
+            return self.window() is not None
+        except (SandboxError, OSError, subprocess.SubprocessError, json.JSONDecodeError):
+            return True  # cannot ask the parent: do not tear down a live sandbox for that
 
     def window(self) -> dict | None:
         pid = self.nested_pid()
@@ -286,64 +335,76 @@ class Sandbox:
     # -- start --
 
     def up(self, size: tuple[int, int] = DEFAULT_SIZE, audio: bool = False) -> dict:
-        self.dir.mkdir(mode=0o700, exist_ok=True)
-        with _locked(self.dir / ".lock"):
-            if self.running():
+        with _locked(self.lock):
+            if self.healthy():
                 return self.status()
+            self._make_dir()
             self._stop_processes()  # a crashed run can leave its bus or apps behind
             self._clean()
-            penv = parent_env()
-            self._start_bus()
-            self._write_config()
-            if audio:
-                for f in ("pipewire-0", "pulse"):
-                    if (RUNTIME / f).exists():
-                        (self.dir / f).symlink_to(RUNTIME / f)
-            nested_sh = self.dir / "nested.sh"
-            parent_wl = penv["WAYLAND_DISPLAY"]
-            if not parent_wl.startswith("/"):
-                parent_wl = str(RUNTIME / parent_wl)
-            nested_sh.write_text(
-                "#!/bin/sh\n"
-                "# written by hypruse-sandbox up: the nested compositor, run by the human's Hyprland\n"
-                f"echo $$ > {shlex.quote(str(self.dir / 'nested.pid'))}\n"
-                f"export XDG_RUNTIME_DIR={shlex.quote(str(self.dir))}\n"
-                # the parent's socket lives outside our runtime directory, so name it by path
-                f"export WAYLAND_DISPLAY={shlex.quote(parent_wl)}\n"
-                f"export DBUS_SESSION_BUS_ADDRESS={shlex.quote('unix:path=' + str(self.bus))}\n"
-                # never push this instance's variables into the human's systemd/D-Bus
-                # activation environment: apps the human starts would open in here
-                "export HYPRLAND_NO_SD_VARS=1 HYPRLAND_NO_SD_NOTIFY=1 HYPRLAND_NO_CRASHREPORTER=1\n"
-                "unset DISPLAY HYPRLAND_INSTANCE_SIGNATURE AT_SPI_BUS_ADDRESS\n"
-                f"exec Hyprland -c {shlex.quote(str(self.dir / 'hyprland.lua'))} "
-                f"> {shlex.quote(str(self.dir / 'nested.log'))} 2>&1\n"
-            )
-            nested_sh.chmod(0o700)
-            w, h = size
-            parent_exec(
-                f"workspace special:{SPECIAL} silent; float on; size {w} {h}; "
-                f"render_unfocused on; no_initial_focus on; tag +{TAG}",
-                str(nested_sh),
-            )
             try:
-                self._wait_started()
+                self._start(size, audio)
             except BaseException:
+                # an error or a signal at any step: nothing half-started survives
                 self._stop_processes()
+                self._clean()
                 raise
             return self.status()
 
+    def _start(self, size: tuple[int, int], audio: bool) -> None:
+        penv = parent_env()
+        self._start_bus()
+        self._write_config()
+        if audio:
+            for f in ("pipewire-0", "pulse"):
+                if (RUNTIME / f).exists():
+                    (self.dir / f).symlink_to(RUNTIME / f)
+        nested_sh = self.dir / "nested.sh"
+        parent_wl = penv["WAYLAND_DISPLAY"]
+        if not parent_wl.startswith("/"):
+            parent_wl = str(RUNTIME / parent_wl)
+        nested_sh.write_text(
+            "#!/bin/sh\n"
+            "# written by hypruse-sandbox up: the nested compositor, run by the human's Hyprland\n"
+            f"echo $$ > {shlex.quote(str(self.dir / 'nested.pid'))}\n"
+            f"export XDG_RUNTIME_DIR={shlex.quote(str(self.dir))} {MEMBER}={shlex.quote(self.name)}\n"
+            # the parent's socket lives outside our runtime directory, so name it by path
+            f"export WAYLAND_DISPLAY={shlex.quote(parent_wl)}\n"
+            f"export DBUS_SESSION_BUS_ADDRESS={shlex.quote('unix:path=' + str(self.bus))}\n"
+            # never push this instance's variables into the human's systemd/D-Bus
+            # activation environment: apps the human starts would open in here
+            "export HYPRLAND_NO_SD_VARS=1 HYPRLAND_NO_SD_NOTIFY=1 HYPRLAND_NO_CRASHREPORTER=1\n"
+            "unset DISPLAY HYPRLAND_INSTANCE_SIGNATURE AT_SPI_BUS_ADDRESS\n"
+            f"exec Hyprland -c {shlex.quote(str(self.dir / 'hyprland.lua'))} "
+            f"> {shlex.quote(str(self.dir / 'nested.log'))} 2>&1\n"
+        )
+        nested_sh.chmod(0o700)
+        w, h = size
+        parent_exec(
+            f"workspace special:{SPECIAL} silent; float on; size {w} {h}; "
+            f"render_unfocused on; no_initial_focus on; tag +{TAG}",
+            str(nested_sh),
+        )
+        self._wait_started()
+
     def _clean(self) -> None:
-        """Remove what a dead instance left behind, keeping the directory (and its
-        lock) so a concurrent `up` serialises on it."""
+        """Remove what a dead instance left behind, keeping the directory."""
+        if not self.dir.exists():
+            return
         for p in self.dir.iterdir():
-            if p.name in (".lock",):
-                continue
             if p.is_dir() and not p.is_symlink():
                 shutil.rmtree(p, ignore_errors=True)
             else:
                 p.unlink(missing_ok=True)
 
     def _start_bus(self) -> None:
+        services = self.dir / "dbus-services"
+        services.mkdir()
+        for svc in BUS_SERVICES:
+            for base in ("/usr/share/dbus-1/services", "/usr/local/share/dbus-1/services"):
+                src = Path(base) / f"{svc}.service"
+                if src.exists():
+                    (services / src.name).symlink_to(src)
+                    break
         conf = self.dir / "dbus.conf"
         conf.write_text(
             '<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"\n'
@@ -353,7 +414,7 @@ class Sandbox:
             "  <keep_umask/>\n"
             f"  <listen>unix:path={self.bus}</listen>\n"
             "  <auth>EXTERNAL</auth>\n"
-            "  <standard_session_servicedirs/>\n"
+            f"  <servicedir>{services}</servicedir>\n"
             '  <policy context="default">\n'
             '    <allow send_destination="*" eavesdrop="true"/>\n'
             '    <allow eavesdrop="true"/>\n'
@@ -437,6 +498,7 @@ class Sandbox:
         else:
             raise SandboxError(f"the nested Hyprland did not come up within {START_TIMEOUT:.0f}s")
         # XWayland: its display number is only known once it runs
+        deadline = time.monotonic() + XWAYLAND_TIMEOUT
         while time.monotonic() < deadline:
             display = self._find_xwayland_display()
             if display:
@@ -447,8 +509,11 @@ class Sandbox:
                 )
                 break
             time.sleep(0.1)
+        else:
+            log("hypruse-sandbox: XWayland did not start; X11 apps will not run in the sandbox")
         # the first frame proves render_unfocused took: a hidden window that gets
         # no frame callbacks never renders, and every capture of it would hang
+        deadline = time.monotonic() + FRAME_TIMEOUT
         while time.monotonic() < deadline:
             try:
                 shot = subprocess.run(
@@ -464,7 +529,7 @@ class Sandbox:
         self.hyprctl("dismissnotify")
 
     def _find_xwayland_display(self) -> str:
-        for pid in _pids_in(self.dir):
+        for pid in _members(self):
             try:
                 argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
             except OSError:
@@ -478,30 +543,30 @@ class Sandbox:
     # -- stop --
 
     def down(self) -> None:
-        if not self.dir.exists():
-            return
-        with _locked(self.dir / ".lock"):
+        with _locked(self.lock):
             self._stop_processes()
             self._clean()
-        with contextlib.suppress(OSError):
-            (self.dir / ".lock").unlink()
-            self.dir.rmdir()
+            with contextlib.suppress(OSError):
+                self.dir.rmdir()
 
     def _stop_processes(self) -> None:
         """The compositor first (its clients mostly exit with it), then every
-        process still running with this sandbox's runtime directory: apps,
-        Xwayland, the bus and what it activated. Never an MCP server that
-        serves this sandbox: that one ends with its own session."""
-        nested = self._pid("nested.pid")
-        if nested and _owned_by(nested, self.dir):
+        process of this sandbox that is left: apps, Xwayland, the bus and what it
+        activated, and their children. Never the caller or its ancestors, and
+        never an MCP server that serves this sandbox: that one ends with its
+        own session."""
+        nested = self.nested_pid()
+        if nested:
             _signal(nested, signal.SIGTERM)
             _wait_gone([nested], 3.0)
-        rest = [p for p in _pids_in(self.dir) if not _is_mcp(p) and p != os.getpid()]
+        rest = _members(self)
         for pid in rest:
             _signal(pid, signal.SIGTERM)
         left = _wait_gone(rest, 3.0)
+        still = set(_members(self))  # a pid recycled in those 3 s is not ours
         for pid in left:
-            _signal(pid, signal.SIGKILL)
+            if pid in still:
+                _signal(pid, signal.SIGKILL)
 
     # -- report --
 
@@ -509,6 +574,7 @@ class Sandbox:
         info: dict = {"name": self.name, "dir": str(self.dir), "running": self.running()}
         if not info["running"]:
             return info
+        info["window"] = None
         info["pid"] = self.nested_pid()
         info["display"] = self._read("display") or None
         with contextlib.suppress(SandboxError, OSError, json.JSONDecodeError):
@@ -517,21 +583,28 @@ class Sandbox:
                 info["window"] = win.get("address")
                 info["size"] = win.get("size")
                 info["workspace"] = (win.get("workspace") or {}).get("name")
-        info["env"] = {k: v for k, v in self.client_env({}).items()}
+        info["env"] = self.client_env({}, member=False)
         return info
 
 
 # --- process helpers -------------------------------------------------------------
 
 
-def _alive(pid: int) -> bool:
+def _state(pid: int) -> str:
+    """The process state letter from /proc/<pid>/stat ('' when gone)."""
     try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return ""
+    return stat.rsplit(")", 1)[1].split()[0]
+
+
+def _alive(pid: int) -> bool:
+    """A zombie counts as gone: it is dead, only not reaped yet (and when it
+    is our own child, reap it so it does not linger)."""
+    with contextlib.suppress(ChildProcessError, OSError):
+        os.waitpid(pid, os.WNOHANG)
+    return _state(pid) not in ("", "Z", "X")
 
 
 def _signal(pid: int, sig: int) -> None:
@@ -556,26 +629,65 @@ def _environ(pid: int) -> dict[bytes, bytes]:
     return dict(kv.split(b"=", 1) for kv in raw.split(b"\0") if b"=" in kv)
 
 
-def _owned_by(pid: int, sandbox_dir: Path) -> bool:
-    """Is `pid` a live process of this sandbox? Checked by environment, so a
-    recycled pid is never signalled."""
-    return _environ(pid).get(b"XDG_RUNTIME_DIR") == str(sandbox_dir).encode()
+def _is_member(pid: int, box: "Sandbox") -> bool:
+    """Does `pid` carry this sandbox's marker? Read from its environment, so a
+    recycled pid is never mistaken for one of ours."""
+    env = _environ(pid)
+    return (
+        env.get(MEMBER.encode()) == box.name.encode()
+        and env.get(b"XDG_RUNTIME_DIR") == str(box.dir).encode()
+    )
 
 
-def _pids_in(sandbox_dir: Path) -> list[int]:
-    want = str(sandbox_dir).encode()
-    out = []
-    for entry in os.scandir("/proc"):
-        if entry.name.isdigit():
-            pid = int(entry.name)
-            with contextlib.suppress(OSError):
-                if entry.stat().st_uid == UID and _environ(pid).get(b"XDG_RUNTIME_DIR") == want:
-                    out.append(pid)
+def _ppid(pid: int) -> int:
+    try:
+        return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def _ancestors(pid: int) -> set[int]:
+    out: set[int] = set()
+    while pid > 1 and pid not in out:
+        out.add(pid)
+        pid = _ppid(pid)
     return out
 
 
-def _is_mcp(pid: int) -> bool:
-    return _environ(pid).get(b"HUS_ROLE") == b"mcp"
+def _members(box: "Sandbox") -> list[int]:
+    """Every process of the sandbox: those carrying its marker, plus their
+    descendants (a Flatpak or `env -i` child does not keep the marker). Minus
+    the caller and its ancestors, and MCP servers of this sandbox with their
+    helpers."""
+    mine: list[int] = []
+    children: dict[int, list[int]] = {}
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        with contextlib.suppress(OSError):
+            if entry.stat().st_uid != UID:
+                continue
+            children.setdefault(_ppid(pid), []).append(pid)
+            if _is_member(pid, box):
+                mine.append(pid)
+    spared = _ancestors(os.getpid())
+    servers = [p for p in mine if _environ(p).get(b"HUS_ROLE") == b"mcp"]
+    stack = list(servers)
+    while stack:  # an MCP server's own helpers (grim, wtype) end with its calls
+        pid = stack.pop()
+        if pid not in spared:
+            spared.add(pid)
+            stack += children.get(pid, [])
+    found: set[int] = set()
+    stack = [p for p in mine if p not in spared]
+    while stack:
+        pid = stack.pop()
+        if pid in found or pid in spared:
+            continue
+        found.add(pid)
+        stack += children.get(pid, [])
+    return sorted(found)
 
 
 def _relink(link: Path, target: str) -> None:
@@ -616,13 +728,14 @@ that the cursor and focus are shared with the human does not apply here.
 
 
 def _claim_name() -> tuple[str, int]:
-    """Each MCP server gets a sandbox of its own, numbered 1..999, claimed by a
-    lock held for the server's lifetime (released by the kernel on a crash)."""
+    """Each MCP server gets a sandbox of its own, m1..m999, claimed by a lock
+    held for the server's lifetime (released by the kernel on a crash)."""
     for n in range(1, 1000):
-        fd = os.open(RUNTIME / f"hus-{n}.claim", os.O_CREAT | os.O_RDWR, 0o600)
+        name = f"{MCP_PREFIX}{n}"
+        fd = os.open(RUNTIME / f"hus-{name}.claim", os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return str(n), fd
+            return name, fd
         except BlockingIOError:
             os.close(fd)
     raise SandboxError("no free sandbox number")
@@ -663,10 +776,14 @@ def mcp(name: str | None, size: tuple[int, int], audio: bool) -> int:
     hypruse = os.environ.get("HUS_HYPRUSE") or shutil.which("hypruse") or "/usr/bin/hypruse"
     env = box.client_env()
     env["HUS_ROLE"] = "mcp"
+    box._make_dir()  # before hypruse creates <dir>/hypruse world-readable
     child = subprocess.Popen([hypruse], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
     out_lock = threading.Lock()
     init_ids: set = set()
+    pending: set = set()  # request ids forwarded and not answered yet
     started = {"by_us": False}
+    failed = {"at": 0.0, "error": ""}
+    closing = threading.Event()
     up_lock = threading.Lock()
     note = MCP_NOTE.format(name=name, w=size[0], h=size[1])
 
@@ -677,13 +794,19 @@ def mcp(name: str | None, size: tuple[int, int], audio: bool) -> int:
 
     def ensure_up() -> str | None:
         with up_lock:
+            # a start that failed moments ago (no GPU, a refused rule) fails the
+            # same way again: answer at once instead of 20 s per call
+            if failed["error"] and time.monotonic() - failed["at"] < FAILED_START_CACHE:
+                return failed["error"]
             try:
-                if not box.running():
+                if not box.healthy():
+                    started["by_us"] = True  # before: a signal mid-start must still tear down
                     box.up(size, audio)
-                    started["by_us"] = True
                     log(f"hypruse-sandbox: sandbox {name} started")
             except (SandboxError, OSError, subprocess.SubprocessError) as exc:
-                return f"hypruse-sandbox could not start sandbox {name}: {exc}"
+                failed.update(at=time.monotonic(), error=f"hypruse-sandbox could not start sandbox {name}: {exc}")
+                return failed["error"]
+        failed["error"] = ""
         return None
 
     def pump_out() -> None:
@@ -694,11 +817,23 @@ def mcp(name: str | None, size: tuple[int, int], audio: bool) -> int:
             except ValueError:
                 emit(raw)
                 continue
+            if isinstance(msg, dict) and "method" not in msg:
+                pending.discard(msg.get("id"))
             if isinstance(msg, dict) and msg.get("id") in init_ids and "result" in msg:
                 init_ids.discard(msg.get("id"))
                 emit(json.dumps(rewrite_initialize(msg, note)).encode())
             else:
                 emit(raw)
+        # hypruse is gone. If we did not ask for that, answer what it left
+        # unanswered and end the server, instead of hanging every later call.
+        if not closing.is_set():
+            for req_id in list(pending):
+                emit(json.dumps({
+                    "jsonrpc": "2.0", "id": req_id,
+                    "error": {"code": -32603, "message": "hypruse exited"},
+                }).encode())
+            log(f"hypruse-sandbox: hypruse exited (code {child.poll()}); stopping")
+            os.kill(os.getpid(), signal.SIGTERM)
 
     reader = threading.Thread(target=pump_out, daemon=True)
     reader.start()
@@ -709,25 +844,39 @@ def mcp(name: str | None, size: tuple[int, int], audio: bool) -> int:
                 msg = json.loads(raw)
             except ValueError:
                 msg = None
-            if isinstance(msg, dict):
-                if msg.get("method") == "initialize":
-                    init_ids.add(msg.get("id"))
-                elif msg.get("method") == "tools/call":
-                    err = ensure_up()
-                    if err:
-                        emit(json.dumps(tool_error(msg.get("id"), err)).encode())
+            batch = msg if isinstance(msg, list) else [msg]
+            calls = [m for m in batch if isinstance(m, dict) and m.get("method") == "tools/call"]
+            for m in batch:
+                if isinstance(m, dict) and m.get("method") == "initialize":
+                    init_ids.add(m.get("id"))
+            if calls:
+                err = ensure_up()
+                if err:
+                    for m in calls:
+                        emit(json.dumps(tool_error(m.get("id"), err)).encode())
+                    rest = [m for m in batch if m not in calls]
+                    if not rest:
                         continue
+                    raw = (json.dumps(rest if isinstance(msg, list) else rest[0]) + "\n").encode()
+            for m in batch:
+                if isinstance(m, dict) and "method" in m and "id" in m:
+                    pending.add(m.get("id"))
             child.stdin.write(raw)
             child.stdin.flush()
     except (BrokenPipeError, KeyboardInterrupt, SystemExit):
         pass
     finally:
+        closing.set()
         with contextlib.suppress(OSError):
             child.stdin.close()  # type: ignore[union-attr]
         try:
             child.wait(timeout=5)
         except subprocess.TimeoutExpired:
             child.terminate()
+            try:
+                child.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                child.kill()
         if claim_fd is not None or started["by_us"]:
             with contextlib.suppress(Exception):
                 box.down()
@@ -764,6 +913,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("show", help="show the sandbox on the human's focused monitor")
     sub.add_parser("hide", help="hide it again")
     args = ap.parse_args(argv)
+    os.umask(0o077)  # logs, configs and captures in the state directory are private
 
     try:
         if args.cmd == "mcp":
@@ -792,7 +942,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "env":
             if not box.running():
                 raise SandboxError(f"sandbox {name} is not running: hypruse-sandbox --name {name} up")
-            env = box.client_env({})
+            env = box.client_env({}, member=False)
             for k, v in env.items():
                 print(f"export {k}={shlex.quote(v)}")
             print("unset " + " ".join(k for k in ENV_DROP if k not in env))
@@ -804,26 +954,41 @@ def main(argv: list[str] | None = None) -> int:
                 raise SandboxError(f"sandbox {name} is not running: hypruse-sandbox --name {name} up")
             os.execvpe(cmd[0], cmd, box.client_env())
         elif args.cmd in ("show", "hide"):
-            if not box.running():
-                raise SandboxError(f"sandbox {name} is not running")
-            shown = any(
-                (m.get("specialWorkspace") or {}).get("name") == f"special:{SPECIAL}"
-                for m in parent_q("monitors")  # type: ignore[union-attr]
-            )
-            if (args.cmd == "show") != shown:
-                parent_dispatch(
-                    "togglespecialworkspace", SPECIAL,
-                    f"hl.dsp.workspace.toggle_special({lua_str(SPECIAL)})",
-                )
-            win = box.window()
-            # several sandboxes share the special workspace: raise this one
-            # (the Lua dispatcher set has no z-order call, so only hyprlang can)
-            if args.cmd == "show" and win and not parent_is_lua():
-                parent_dispatch("alterzorder", f"top,address:{win['address']}", "")
+            show_hide(box, args.cmd == "show")
         return 0
-    except SandboxError as exc:
+    except (SandboxError, OSError, subprocess.SubprocessError) as exc:
         log(f"hypruse-sandbox: {exc}")
         return 1
+
+
+def show_hide(box: Sandbox, show: bool) -> None:
+    """Toggle the special workspace on the human's FOCUSED monitor, the only one
+    Hyprland's toggle acts on: toggling while it is open on another monitor
+    would move it there instead of closing it."""
+    if not box.healthy():
+        raise SandboxError(f"sandbox {box.name} is not running")
+    monitors = parent_q("monitors")
+    focused = next((m for m in monitors if m.get("focused")), None)  # type: ignore[union-attr]
+    open_on = [m["name"] for m in monitors  # type: ignore[union-attr]
+               if (m.get("specialWorkspace") or {}).get("name") == f"special:{SPECIAL}"]
+    here = focused is not None and focused["name"] in open_on
+    if show and not here or not show and here:
+        parent_dispatch(
+            "togglespecialworkspace", SPECIAL,
+            f"hl.dsp.workspace.toggle_special({lua_str(SPECIAL)})",
+        )
+    elif not show and open_on:
+        raise SandboxError(
+            f"it is open on {', '.join(open_on)}, not on the focused monitor: "
+            "focus that monitor and run hide again"
+        )
+    win = box.window()
+    if show and win:  # several sandboxes share the workspace: raise this one
+        addr = f"address:{win['address']}"
+        parent_dispatch(
+            "alterzorder", f"top,{addr}",
+            f'hl.dsp.window.alter_zorder({{ mode = "top", window = {lua_str(addr)} }})',
+        )
 
 
 if __name__ == "__main__":

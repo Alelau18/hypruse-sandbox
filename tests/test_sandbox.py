@@ -91,6 +91,9 @@ def test_client_env_points_everything_into_the_sandbox(runtime):
     # the human's X display and a11y bus must never leak into the sandbox
     for gone in ("DISPLAY", "AT_SPI_BUS_ADDRESS", "WAYLAND_SOCKET"):
         assert gone not in env
+    assert env[hs.MEMBER] == "t"
+    # what `env` prints for a human's shell carries no membership marker
+    assert hs.MEMBER not in box.client_env(base, member=False)
     box.dir.mkdir()
     (box.dir / "display").write_text(":5\n")
     assert box.client_env(base)["DISPLAY"] == ":5"
@@ -117,13 +120,14 @@ def test_parent_exec_speaks_both_dialects(monkeypatch, lua):
     fake = FakeHyprctl(lua)
     monkeypatch.setattr(hs, "_hyprctl_ok", fake)
     monkeypatch.setattr(hs, "parent_env", lambda: {})
-    hs.parent_exec("workspace special:hypruse silent", "/x/nested.sh")
+    hs.parent_exec("workspace special:hypruse silent", "/x y/nested.sh")
     sent = fake.calls[-1]
     if lua:
         assert sent[0] == "dispatch" and sent[1].startswith("hl.dsp.exec_cmd(")
-        assert "special:hypruse" in sent[1] and "/x/nested.sh" in sent[1]
+        assert "special:hypruse" in sent[1] and "nested.sh" in sent[1]
     else:
-        assert sent == ["dispatch", "exec", "[workspace special:hypruse silent] /x/nested.sh"]
+        # quoted for the /bin/sh -c Hyprland runs it through
+        assert sent == ["dispatch", "exec", "[workspace special:hypruse silent] exec '/x y/nested.sh'"]
 
 
 def test_parent_exec_reports_a_refusal(monkeypatch):
@@ -188,29 +192,71 @@ def _spawn(env_extra: dict[str, str]) -> subprocess.Popen:
     return subprocess.Popen(["sleep", "30"], env=env)
 
 
-def test_stop_processes_kills_the_sandbox_and_spares_its_mcp_server(runtime):
+def _member_env(box) -> dict[str, str]:
+    return {"XDG_RUNTIME_DIR": str(box.dir), hs.MEMBER: box.name}
+
+
+def test_stop_processes_kills_the_sandbox_and_spares_the_rest(runtime):
     box = hs.Sandbox("t")
     box.dir.mkdir()
-    app = _spawn({"XDG_RUNTIME_DIR": str(box.dir)})
-    server = _spawn({"XDG_RUNTIME_DIR": str(box.dir), "HUS_ROLE": "mcp"})
+    app = _spawn(_member_env(box))
+    server = _spawn({**_member_env(box), "HUS_ROLE": "mcp"})
     stranger = _spawn({"XDG_RUNTIME_DIR": str(runtime)})
+    # a human's shell after `eval "$(hypruse-sandbox env)"`: same runtime dir, no marker
+    shell = _spawn({"XDG_RUNTIME_DIR": str(box.dir)})
     try:
         time.sleep(0.1)
-        assert set(hs._pids_in(box.dir)) == {app.pid, server.pid}
+        assert set(hs._members(box)) == {app.pid}
         box._stop_processes()
         assert app.wait(timeout=5) is not None
         time.sleep(0.1)
-        assert server.poll() is None and stranger.poll() is None
+        assert server.poll() is None and stranger.poll() is None and shell.poll() is None
     finally:
-        for p in (app, server, stranger):
+        for p in (app, server, stranger, shell):
             p.kill()
             p.wait()
+
+
+def test_stop_processes_follows_children_that_dropped_the_marker(runtime):
+    box = hs.Sandbox("t")
+    box.dir.mkdir()
+    # a member whose child runs with a wiped environment (Flatpak, env -i)
+    parent = subprocess.Popen(
+        ["sh", "-c", "env -i sleep 30 & echo $!; wait"],
+        env=dict(os.environ, **_member_env(box)), stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        child = int(parent.stdout.readline())
+        assert child in hs._members(box)
+        box._stop_processes()
+        time.sleep(0.1)
+        assert not hs._alive(child)
+    finally:
+        parent.kill()
+        parent.wait()
+
+
+def test_the_caller_and_its_ancestors_are_never_members(runtime, monkeypatch):
+    box = hs.Sandbox("t")
+    box.dir.mkdir()
+    me = os.getpid()
+    monkeypatch.setattr(hs, "_is_member", lambda pid, b: pid == me)
+    assert me not in hs._members(box)
+
+
+def test_a_zombie_counts_as_gone():
+    proc = subprocess.Popen(["true"])
+    deadline = time.monotonic() + 5
+    while hs._state(proc.pid) not in ("Z", "") and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert not hs._alive(proc.pid)  # and it reaps it
+    assert hs._state(proc.pid) == ""
 
 
 def test_a_recycled_pid_is_never_signalled(runtime):
     box = hs.Sandbox("t")
     box.dir.mkdir()
-    other = _spawn({"XDG_RUNTIME_DIR": str(runtime)})  # not this sandbox's
+    other = _spawn({"XDG_RUNTIME_DIR": str(box.dir)})  # same dir, but not a member
     try:
         (box.dir / "nested.pid").write_text(str(other.pid))
         assert box.nested_pid() is None
@@ -229,6 +275,15 @@ def test_down_removes_the_state_directory(runtime):
     (box.dir / "nested.log").write_text("x")
     box.down()
     assert not box.dir.exists()
+    assert box.lock.exists() and box.lock.parent == runtime  # never unlinked
+
+
+def test_up_and_mcp_make_the_state_directory_private(runtime):
+    box = hs.Sandbox("t")
+    box.dir.mkdir(mode=0o755)  # as hypruse leaves it when it starts first
+    os.chmod(box.dir, 0o755)
+    box._make_dir()
+    assert (box.dir.stat().st_mode & 0o777) == 0o700
 
 
 # --- the MCP proxy ----------------------------------------------------------------
@@ -269,7 +324,7 @@ def _run_proxy(monkeypatch, runtime, requests, up_fails=False):
         state["down"] += 1
         state["running"] = False
 
-    monkeypatch.setattr(hs.Sandbox, "running", lambda self: state["running"])
+    monkeypatch.setattr(hs.Sandbox, "healthy", lambda self: state["running"])
     monkeypatch.setattr(hs.Sandbox, "up", fake_up)
     monkeypatch.setattr(hs.Sandbox, "down", fake_down)
     stdin = io.TextIOWrapper(io.BytesIO("".join(json.dumps(r) + "\n" for r in requests).encode()))
@@ -282,6 +337,16 @@ def _run_proxy(monkeypatch, runtime, requests, up_fails=False):
     return [json.loads(x) for x in lines], state
 
 
+DYING_SERVER = r'''
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("method") == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"instructions": "X"}}), flush=True)
+    elif msg.get("method") == "tools/call":
+        sys.exit(1)  # crashes mid-call, never answering
+'''
+
 INIT = {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}}
 LIST = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
 CALL = {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "desktop", "arguments": {}}}
@@ -293,7 +358,7 @@ def test_proxy_rewrites_instructions_and_starts_the_sandbox_on_the_first_call(mo
     init = by_id[0]["result"]
     assert init["instructions"].startswith("This is hypruse-sandbox")
     assert init["instructions"].endswith("ORIGINAL")
-    assert 'sandbox "1"' in init["instructions"]
+    assert 'sandbox "m1"' in init["instructions"]
     assert init["serverInfo"]["name"] == "hypruse-sandbox"
     assert by_id[2]["result"]["content"][0]["text"] == "called desktop"
     assert state["up"] == 1  # once, before the call, not for initialize or tools/list
@@ -316,10 +381,83 @@ def test_each_server_claims_its_own_number(runtime):
     a, fd_a = hs._claim_name()
     b, fd_b = hs._claim_name()
     try:
-        assert (a, b) == ("1", "2")
+        assert (a, b) == ("m1", "m2")
     finally:
         os.close(fd_a)
         os.close(fd_b)
     c, fd_c = hs._claim_name()  # released claims are reused
     os.close(fd_c)
-    assert c == "1"
+    assert c == "m1"
+
+
+def test_proxy_starts_the_sandbox_for_a_batched_call(monkeypatch, runtime):
+    out, state = _run_proxy(monkeypatch, runtime, [INIT, [LIST, CALL]])
+    assert state["up"] == 1
+
+
+def test_a_failed_start_is_not_retried_on_every_call(monkeypatch, runtime):
+    call2 = dict(CALL, id=3)
+    out, state = _run_proxy(monkeypatch, runtime, [INIT, CALL, call2], up_fails=True)
+    assert state["up"] == 1
+    assert all(m["result"]["isError"] for m in out if m["id"] in (2, 3))
+
+
+def test_proxy_ends_and_answers_when_hypruse_dies(monkeypatch, runtime):
+    fake = runtime / "dying.py"
+    fake.write_text(DYING_SERVER)
+    wrapper = runtime / "dying"
+    wrapper.write_text(f"#!/bin/sh\nexec {sys.executable} -I {fake}\n")
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("HUS_HYPRUSE", str(wrapper))
+    monkeypatch.setattr(hs.Sandbox, "healthy", lambda self: True)
+    monkeypatch.setattr(hs.Sandbox, "down", lambda self: None)
+    rfd, wfd = os.pipe()  # a client that keeps stdin open, like Claude Code
+    os.write(wfd, (json.dumps(INIT) + "\n" + json.dumps(CALL) + "\n").encode())
+    stdout = io.TextIOWrapper(io.BytesIO())
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(os.fdopen(rfd, "rb")))
+    monkeypatch.setattr(sys, "stdout", stdout)
+    try:
+        hs.mcp(None, (1920, 1080), False)  # returns instead of blocking on stdin
+    finally:
+        os.close(wfd)
+    stdout.flush()
+    msgs = [json.loads(x) for x in stdout.buffer.getvalue().decode().splitlines()]
+    call = next(m for m in msgs if m.get("id") == 2)
+    assert call["error"]["message"] == "hypruse exited"
+
+
+# --- show / hide ------------------------------------------------------------------
+
+
+def _monitors(focused: str, special_on: str | None):
+    return [
+        {"name": n, "focused": n == focused,
+         "specialWorkspace": {"name": "special:hypruse" if n == special_on else ""}}
+        for n in ("DP-1", "HDMI-A-1")
+    ]
+
+
+@pytest.mark.parametrize(
+    "show,focused,open_on,toggles,raises",
+    [
+        (True, "DP-1", None, True, False),
+        (True, "DP-1", "DP-1", False, False),
+        (False, "DP-1", "DP-1", True, False),
+        (False, "DP-1", None, False, False),
+        # open on the other monitor: a toggle here would MOVE it, not hide it
+        (False, "DP-1", "HDMI-A-1", False, True),
+    ],
+)
+def test_show_hide_acts_on_the_focused_monitor_only(monkeypatch, runtime, show, focused, open_on, toggles, raises):
+    sent = []
+    monkeypatch.setattr(hs.Sandbox, "healthy", lambda self: True)
+    monkeypatch.setattr(hs.Sandbox, "window", lambda self: None)
+    monkeypatch.setattr(hs, "parent_q", lambda what: _monitors(focused, open_on))
+    monkeypatch.setattr(hs, "parent_dispatch", lambda name, arg, lua: sent.append(name))
+    box = hs.Sandbox("t")
+    if raises:
+        with pytest.raises(hs.SandboxError, match="HDMI-A-1"):
+            hs.show_hide(box, show)
+    else:
+        hs.show_hide(box, show)
+    assert ("togglespecialworkspace" in sent) == toggles
