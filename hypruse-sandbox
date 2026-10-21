@@ -239,6 +239,9 @@ class Sandbox:
             XDG_CURRENT_DESKTOP="Hyprland",
             XDG_SESSION_TYPE="wayland",
             HUS_SANDBOX=self.name,
+            # nobody else sits at this desktop: hypruse's background mode would
+            # send apps to a hidden workspace inside it and type blind
+            HYPRUSE_BACKGROUND="0",
         )
         display = self._read("display")
         if display:
@@ -368,6 +371,30 @@ class Sandbox:
         if proc.returncode != 0 or not pid.isdigit():
             raise SandboxError(f"dbus-daemon failed: {proc.stderr.strip() or proc.stdout.strip()}")
         (self.dir / "dbus.pid").write_text(pid)
+        self._start_a11y_registry()
+
+    def _start_a11y_registry(self) -> None:
+        """The accessibility registry, started by hand before any app.
+
+        at-spi-bus-launcher runs the a11y bus on dbus-broker when it is
+        installed, and dbus-broker can only activate services through systemd,
+        which knows nothing of this bus: the registry stays "activatable" and
+        every tree read fails with NameHasNoOwner. An app that starts before
+        the registry never shows up in it, so this runs before the compositor.
+        Starting it also brings the a11y bus up (it asks org.a11y.Bus here)."""
+        registryd = next(
+            (p for p in ("/usr/lib/at-spi2-registryd", "/usr/libexec/at-spi2-registryd",
+                         "/usr/lib/at-spi2-core/at-spi2-registryd") if os.access(p, os.X_OK)),
+            None,
+        )
+        if registryd is None:
+            log("hypruse-sandbox: at-spi2-registryd not found; ui/click_ui will see no trees")
+            return
+        with open(self.dir / "a11y.log", "wb") as out:
+            subprocess.Popen(
+                [registryd], env=self.client_env(), stdin=subprocess.DEVNULL,
+                stdout=out, stderr=out, start_new_session=True,
+            )
 
     def _write_config(self) -> None:
         kb = {k: parent_option(f"input:{k}") for k in ("kb_layout", "kb_variant", "kb_options", "kb_model")}
@@ -635,7 +662,6 @@ def mcp(name: str | None, size: tuple[int, int], audio: bool) -> int:
     signal.signal(signal.SIGHUP, _stop)
     hypruse = os.environ.get("HUS_HYPRUSE") or shutil.which("hypruse") or "/usr/bin/hypruse"
     env = box.client_env()
-    env.setdefault("HYPRUSE_BACKGROUND", "0")  # nobody else sits at this desktop
     env["HUS_ROLE"] = "mcp"
     child = subprocess.Popen([hypruse], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
     out_lock = threading.Lock()
