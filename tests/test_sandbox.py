@@ -325,6 +325,7 @@ def _run_proxy(monkeypatch, runtime, requests, up_fails=False):
         state["running"] = False
 
     monkeypatch.setattr(hs.Sandbox, "healthy", lambda self: state["running"])
+    monkeypatch.setattr(hs, "_spawn_watcher", lambda name: None)
     monkeypatch.setattr(hs.Sandbox, "up", fake_up)
     monkeypatch.setattr(hs.Sandbox, "down", fake_down)
     stdin = io.TextIOWrapper(io.BytesIO("".join(json.dumps(r) + "\n" for r in requests).encode()))
@@ -411,6 +412,7 @@ def test_proxy_ends_and_answers_when_hypruse_dies(monkeypatch, runtime):
     monkeypatch.setenv("HUS_HYPRUSE", str(wrapper))
     monkeypatch.setattr(hs.Sandbox, "healthy", lambda self: True)
     monkeypatch.setattr(hs.Sandbox, "down", lambda self: None)
+    monkeypatch.setattr(hs, "_spawn_watcher", lambda name: None)
     rfd, wfd = os.pipe()  # a client that keeps stdin open, like Claude Code
     os.write(wfd, (json.dumps(INIT) + "\n" + json.dumps(CALL) + "\n").encode())
     stdout = io.TextIOWrapper(io.BytesIO())
@@ -461,3 +463,39 @@ def test_show_hide_acts_on_the_focused_monitor_only(monkeypatch, runtime, show, 
     else:
         hs.show_hide(box, show)
     assert ("togglespecialworkspace" in sent) == toggles
+
+
+# --- the watcher ------------------------------------------------------------------
+
+
+def _watch_proc(runtime, name, pid):
+    return subprocess.Popen(
+        [sys.executable, "-I", str(SCRIPT), "--name", name, "_watch", str(pid)],
+        env=dict(os.environ, XDG_RUNTIME_DIR=str(runtime)),
+    )
+
+
+def test_watcher_takes_the_sandbox_down_after_its_server_dies(runtime):
+    box = hs.Sandbox("m7")
+    box.dir.mkdir()
+    (box.dir / "nested.log").write_text("x")
+    server = subprocess.Popen(["sleep", "30"])
+    watcher = _watch_proc(runtime, "m7", server.pid)
+    time.sleep(0.3)
+    assert box.dir.exists()  # nothing happens while the server lives
+    server.kill()
+    server.wait()
+    watcher.wait(timeout=10)
+    assert not box.dir.exists()
+
+
+def test_watcher_leaves_a_reclaimed_sandbox_alone(runtime):
+    box = hs.Sandbox("m8")
+    box.dir.mkdir()
+    claim = hs._try_claim("m8")  # a new server already took the name
+    try:
+        watcher = _watch_proc(runtime, "m8", 999999999)  # long gone
+        watcher.wait(timeout=10)
+        assert box.dir.exists()
+    finally:
+        os.close(claim)
