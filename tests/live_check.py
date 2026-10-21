@@ -128,14 +128,14 @@ def main() -> int:
             record("type into zenity", typed.returncode == 0, typed.stdout.strip()[:80])
             ui = hy("ui", "--window", zen["address"])
             record("a11y reads the typed value", 'value="sandbox ok"' in ui.stdout, ui.stdout.strip()[:120])
+            sel = hy("ui", "--window", "class:zenity")
+            record("window selector class:zenity", sel.returncode == 0 and 'value="sandbox ok"' in sel.stdout, (sel.stderr or sel.stdout).strip()[:100])
             ok_line = next((ln for ln in ui.stdout.splitlines() if 'button "OK"' in ln), "")
             if ok_line:
                 x, y = ok_line.rsplit("@", 1)[1].split()[0].split(",")
                 hy("pointer", "click", x, y)
                 gone = wait_until(lambda: not any(c["class"] == "zenity" for c in box_clients()), 5)
                 record("pixel click on OK closes it", bool(gone))
-            sel = hy("ui", "--window", "class:zenity")
-            record("window selector class:zenity", sel.returncode in (0, 4) and "not found" not in sel.stderr, (sel.stderr or sel.stdout).strip()[:100])
 
         # GPU apps keep animating while the sandbox is hidden
         hy("launch", "--wait", "10", "--", "vkcube")
