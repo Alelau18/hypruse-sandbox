@@ -499,3 +499,59 @@ def test_watcher_leaves_a_reclaimed_sandbox_alone(runtime):
         assert box.dir.exists()
     finally:
         os.close(claim)
+
+
+# --- silent audio -----------------------------------------------------------------
+
+
+def test_sandbox_apps_get_the_alsa_lockout_unless_audio_is_the_humans(runtime):
+    box = hs.Sandbox("t")
+    box.dir.mkdir()
+    env = box.client_env({"PULSE_SERVER": "unix:/run/user/1000/pulse/native", "PIPEWIRE_REMOTE": "x",
+                          "ALSA_CONFIG_PATH": "/usr/share/alsa/alsa.conf"})
+    assert env["ALSA_CONFIG_PATH"] == str(box.alsa_conf)
+    assert "PULSE_SERVER" not in env and "PIPEWIRE_REMOTE" not in env
+    (box.dir / "audio-host").write_text("1\n")
+    assert "ALSA_CONFIG_PATH" not in box.client_env({})
+
+
+def test_the_alsa_config_names_no_hardware():
+    conf = "\n".join(ln for ln in hs.ALSA_CONF.splitlines() if not ln.lstrip().startswith("#"))
+    assert "type pipewire" in conf
+    for hw in ("pcm.hw", "plughw", "pcm.front", "cards.", "type hw"):
+        assert hw not in conf
+
+
+def test_the_audio_stack_cannot_load_hardware_plugins(runtime, monkeypatch):
+    box = hs.Sandbox("t")
+    box.dir.mkdir()
+    spawned = []
+
+    class FakePopen:
+        def __init__(self, argv, env, **kw):
+            spawned.append((argv, env))
+
+    monkeypatch.setattr(hs.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(hs.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(hs.Sandbox, "_wait_socket", lambda self, path, timeout: True)
+    box._start_audio()
+    spa = box.dir / "audio" / "spa"
+    assert {p.name for p in spa.iterdir()} <= set(hs.SPA_ALLOWED)
+    for banned in ("alsa", "bluez5", "v4l2", "libcamera", "avb"):
+        assert not (spa / banned).exists()
+    assert (box.dir / "audio" / "pw" / "pipewire.conf.d" / "50-silent-sink.conf").read_text() == hs.SILENT_SINK_CONF
+    argvs = [a for a, _ in spawned]
+    assert argvs[-1][-1] == "--profile=policy"  # stock profile: no hardware monitors
+    for _, env in spawned:
+        assert env["SPA_PLUGIN_DIR"] == str(spa)
+        assert env["XDG_STATE_HOME"].startswith(str(box.dir))  # never the human's WirePlumber state
+        assert env[hs.MEMBER] == "t"  # so `down` stops it
+
+
+def test_no_pipewire_still_writes_the_alsa_lockout(runtime, monkeypatch):
+    box = hs.Sandbox("t")
+    box.dir.mkdir()
+    monkeypatch.setattr(hs.shutil, "which", lambda name: None)
+    monkeypatch.setattr(hs.subprocess, "Popen", lambda *a, **k: pytest.fail("nothing to start"))
+    box._start_audio()
+    assert box.alsa_conf.read_text() == hs.ALSA_CONF

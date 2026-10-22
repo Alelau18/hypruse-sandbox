@@ -33,8 +33,33 @@ No compositor plugin is needed, and nothing changes on your monitors.
 
 | | |
 |---|---|
-| Isolated | cursor, keyboard focus, workspaces, windows, XWayland display, D-Bus session (portals, notifications, the accessibility registry), audio (off unless `--audio`) |
+| Isolated | cursor, keyboard focus, workspaces, windows, XWayland display, D-Bus session (only the accessibility bus can be activated on it), sound (see below) |
 | Not isolated | the filesystem and your home directory; an app that is already running for you (a browser on the same profile) hands its new window to that instance, on your screen. Give such apps their own profile. |
+
+### Sound
+
+Each sandbox runs its own PipeWire, `pipewire-pulse` and WirePlumber with a
+single null sink, so apps play at real-time speed and nothing reaches your
+speakers. That sink matters: an app that finds no sound server at all does not
+go quiet. Wine/Proton falls back to opening the sound card's ALSA device
+directly, which takes the card from your PipeWire. Your sink disappears and
+sound jumps to another output.
+
+The sandbox's audio stack cannot touch hardware:
+- its SPA plugin path holds no `alsa`, `bluez5` or `v4l2` plugin;
+- WirePlumber runs the stock `policy` profile, which loads no device monitors;
+- WirePlumber's state stays in the sandbox's runtime directory.
+
+Apps in the sandbox also get an ALSA config (`ALSA_CONFIG_PATH`) that defines only
+the PipeWire devices. A `hw:`/`plughw:` name fails to open, even if the sound
+server is gone. `hypruse-sandbox status` warns if a sandbox process ever holds a
+`/dev/snd` PCM device.
+
+`up --audio` links your own PipeWire/Pulse sockets in instead, so you hear the app.
+
+Proton games run inside a pressure-vessel container. The container maps the
+sandbox's runtime directory to `/run/user/<uid>`, where it finds the sandbox's
+own `pipewire-0` and `pulse/native` sockets.
 
 ## Use
 
@@ -79,5 +104,7 @@ for full speed while you watch.
 ## Tests
 
 ```sh
-python3 -m pytest -q -p no:cacheprovider tests/
+python3 -m pytest -q -p no:cacheprovider tests/test_sandbox.py   # unit, no desktop
+python3 tests/live_check.py                                       # live: drives apps in a sandbox
+python3 -I tests/audio/live_audio.py                              # live: sound isolation, Wine included
 ```

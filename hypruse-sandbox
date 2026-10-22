@@ -80,6 +80,9 @@ ENV_DROP = (
     "WAYLAND_SOCKET", "DISPLAY", "AT_SPI_BUS_ADDRESS", "HL_INITIAL_WORKSPACE_TOKEN",
     "HL_EXEC_RULE_TOKEN", "XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID", "HYPRLAND_CMD",
     "SWAYSOCK", "I3SOCK",
+    # anything that would point an app at the human's sound server or ALSA setup
+    "PULSE_SERVER", "PULSE_RUNTIME_PATH", "PULSE_SINK", "PIPEWIRE_REMOTE",
+    "PIPEWIRE_RUNTIME_DIR", "ALSA_CONFIG_PATH",
 )
 # The marker that makes a process the sandbox's, for `down`. Everything the tool
 # starts carries it (the compositor and so every app it launches, the bus and
@@ -91,6 +94,37 @@ MEMBER = "HUS_MEMBER"
 # the human's settings, a second kwalletd on the human's wallet, kded, and so on.
 # Without them an app falls back (its own file dialog, settings unsaved).
 BUS_SERVICES = ("org.a11y.Bus",)
+# Silence without a hole. An app that finds no sound server does not go quiet:
+# Wine/Proton falls back to opening the card's ALSA device directly, which takes
+# it from the human's PipeWire (their sink disappears, sound jumps to another
+# output). So each sandbox runs its own PipeWire whose only sink goes nowhere,
+# and ALSA inside the sandbox knows no device but that PipeWire.
+SPA_ALLOWED = ("support", "audioconvert", "audiomixer", "control", "aec", "filter-graph")
+SILENT_SINK_CONF = """\
+# Written by hypruse-sandbox: the sandbox's only sound output, which goes nowhere.
+context.objects = [
+  { factory = adapter
+    args = {
+      factory.name     = support.null-audio-sink
+      node.name        = "hus-silent"
+      node.description = "hypruse sandbox (silent)"
+      media.class      = "Audio/Sink"
+      audio.position   = [ FL FR ]
+      object.linger    = true
+      priority.session = 2000
+    }
+  }
+]
+"""
+ALSA_CONF = """\
+# Written by hypruse-sandbox: ALSA in the sandbox knows only PipeWire (the
+# sandbox's own, silent one). With no hw:, plughw: or card definitions, an app
+# cannot reach a sound card through ALSA and take it from the human.
+pcm.!default { type pipewire playback_node "-1" capture_node "-1" }
+ctl.!default { type pipewire }
+pcm.pipewire { type pipewire playback_node "-1" capture_node "-1" }
+ctl.pipewire { type pipewire }
+"""
 MCP_PREFIX = "m"  # MCP servers claim m1, m2, ...: never a name a human picked
 FAILED_START_CACHE = 15.0
 
@@ -240,6 +274,15 @@ class Sandbox:
         return self.dir / "bus"
 
     @property
+    def host_audio(self) -> bool:
+        """`up --audio`: apps use the human's sound server (and speakers)."""
+        return (self.dir / "audio-host").exists()
+
+    @property
+    def alsa_conf(self) -> Path:
+        return self.dir / "audio" / "alsa.conf"
+
+    @property
     def lock(self) -> Path:
         # beside the state directory, never inside it: `down` removes the
         # directory, and a lock file unlinked under a waiting `up` would let a
@@ -282,6 +325,8 @@ class Sandbox:
         )
         if member:
             env[MEMBER] = self.name
+        if not self.host_audio:
+            env["ALSA_CONFIG_PATH"] = str(self.alsa_conf)
         display = self._read("display")
         if display:
             env["DISPLAY"] = display
@@ -356,9 +401,13 @@ class Sandbox:
         self._start_bus()
         self._write_config()
         if audio:
+            (self.dir / "audio-host").write_text("1\n")
             for f in ("pipewire-0", "pulse"):
                 if (RUNTIME / f).exists():
                     (self.dir / f).symlink_to(RUNTIME / f)
+        else:
+            self._start_audio()  # before the compositor, so its apps find it at once
+        alsa = "" if audio else f"export ALSA_CONFIG_PATH={shlex.quote(str(self.alsa_conf))}\n"
         nested_sh = self.dir / "nested.sh"
         parent_wl = penv["WAYLAND_DISPLAY"]
         if not parent_wl.startswith("/"):
@@ -375,6 +424,8 @@ class Sandbox:
             # activation environment: apps the human starts would open in here
             "export HYPRLAND_NO_SD_VARS=1 HYPRLAND_NO_SD_NOTIFY=1 HYPRLAND_NO_CRASHREPORTER=1\n"
             "unset DISPLAY HYPRLAND_INSTANCE_SIGNATURE AT_SPI_BUS_ADDRESS\n"
+            "unset PULSE_SERVER PULSE_RUNTIME_PATH PULSE_SINK PIPEWIRE_REMOTE PIPEWIRE_RUNTIME_DIR ALSA_CONFIG_PATH\n"
+            f"{alsa}"
             f"exec Hyprland -c {shlex.quote(str(self.dir / 'hyprland.lua'))} "
             f"> {shlex.quote(str(self.dir / 'nested.log'))} 2>&1\n"
         )
@@ -465,6 +516,58 @@ class Sandbox:
                 [registryd], env=self.client_env(), stdin=subprocess.DEVNULL,
                 stdout=out, stderr=out, start_new_session=True,
             )
+
+    def _start_audio(self) -> None:
+        """The sandbox's own PipeWire, pipewire-pulse and WirePlumber, with one
+        null sink. They cannot touch sound hardware whatever their config says:
+        their SPA plugin path holds no alsa, bluez5 or v4l2 plugin, and
+        WirePlumber runs the stock `policy` profile, which loads no hardware
+        monitor. Its state (stream volumes, routes) stays in the sandbox, away
+        from the human's. A failure here is not fatal: apps then find no
+        server, and the ALSA config still keeps them off the card."""
+        root = self.dir / "audio"
+        pw = root / "pw"
+        (pw / "pipewire.conf.d").mkdir(parents=True)
+        self.alsa_conf.write_text(ALSA_CONF)
+        pipewire, wireplumber = shutil.which("pipewire"), shutil.which("wireplumber")
+        stock = Path("/usr/share/pipewire")
+        if not (pipewire and wireplumber and (stock / "pipewire.conf").exists()):
+            log("hypruse-sandbox: PipeWire not found; sandbox apps get no sound server "
+                "(ALSA is still kept off the sound card)")
+            return
+        # PIPEWIRE_CONFIG_DIR replaces the search path: copy the stock configs in
+        for name in ("pipewire.conf", "pipewire-pulse.conf"):
+            shutil.copy(stock / name, pw / name)
+        (pw / "pipewire.conf.d" / "50-silent-sink.conf").write_text(SILENT_SINK_CONF)
+        spa = root / "spa"
+        spa.mkdir()
+        for sub in SPA_ALLOWED:
+            if Path(f"/usr/lib/spa-0.2/{sub}").is_dir():
+                (spa / sub).symlink_to(f"/usr/lib/spa-0.2/{sub}")
+        env = self.client_env()
+        env.update(PIPEWIRE_CONFIG_DIR=str(pw), SPA_PLUGIN_DIR=str(spa), XDG_STATE_HOME=str(root / "state"))
+
+        def spawn(argv: list[str], logname: str) -> None:
+            with open(root / logname, "wb") as out:
+                subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=out,
+                                 stderr=out, start_new_session=True)
+
+        spawn([pipewire], "pipewire.log")
+        if not self._wait_socket(self.dir / "pipewire-0", 5.0):
+            log(f"hypruse-sandbox: the sandbox's PipeWire did not start; see {root / 'pipewire.log'}")
+            return
+        spawn([pipewire, "-c", "pipewire-pulse.conf"], "pipewire-pulse.log")
+        spawn([wireplumber, "--profile=policy"], "wireplumber.log")
+        if not self._wait_socket(self.dir / "pulse" / "native", 5.0):
+            log(f"hypruse-sandbox: the sandbox's pipewire-pulse did not start; see {root / 'pipewire-pulse.log'}")
+
+    def _wait_socket(self, path: Path, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._sock_alive(path):
+                return True
+            time.sleep(0.05)
+        return False
 
     def _write_config(self) -> None:
         kb = {k: parent_option(f"input:{k}") for k in ("kb_layout", "kb_variant", "kb_options", "kb_model")}
@@ -586,6 +689,11 @@ class Sandbox:
         info["window"] = None
         info["pid"] = self.nested_pid()
         info["display"] = self._read("display") or None
+        info["audio"] = "host" if self.host_audio else (
+            "silent" if self._sock_alive(self.dir / "pulse" / "native") else "none")
+        holders = sorted(p for p, _ in _snd_holders().items() if p in set(_members(self)))
+        if holders:  # should never happen; it means an app took a sound card
+            info["holds_sound_card"] = holders
         with contextlib.suppress(SandboxError, OSError, json.JSONDecodeError):
             win = self.window()
             if win:
@@ -636,6 +744,21 @@ def _environ(pid: int) -> dict[bytes, bytes]:
     except OSError:
         return {}
     return dict(kv.split(b"=", 1) for kv in raw.split(b"\0") if b"=" in kv)
+
+
+def _snd_holders() -> dict[int, list[str]]:
+    """Processes of this user with a sound card's PCM device open."""
+    held: dict[int, list[str]] = {}
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        with contextlib.suppress(OSError):
+            for fd in os.scandir(f"/proc/{entry.name}/fd"):
+                with contextlib.suppress(OSError):
+                    target = os.readlink(fd.path)
+                    if target.startswith("/dev/snd/pcm"):
+                        held.setdefault(int(entry.name), []).append(target)
+    return held
 
 
 def _is_member(pid: int, box: "Sandbox") -> bool:
@@ -992,7 +1115,10 @@ def main(argv: list[str] | None = None) -> int:
                 print("no sandboxes")
             for st in report if not args.json else []:
                 state = "running" if st["running"] else "stopped"
-                extra = f" pid {st.get('pid')} window {st.get('window')} size {st.get('size')}" if st["running"] else ""
+                extra = (f" pid {st.get('pid')} window {st.get('window')} size {st.get('size')} audio {st.get('audio')}"
+                         if st["running"] else "")
+                if st.get("holds_sound_card"):
+                    extra += f"  WARNING: pids {st['holds_sound_card']} hold a sound card"
                 print(f"{st['name']}: {state}{extra}")
         elif args.cmd == "env":
             if not box.running():
