@@ -58,8 +58,9 @@ server is gone. `hypruse-sandbox status` warns if a sandbox process ever holds a
 `up --audio` links your own PipeWire/Pulse sockets in instead, so you hear the app.
 
 Proton games run inside a pressure-vessel container. The container maps the
-sandbox's runtime directory to `/run/user/<uid>`, where it finds the sandbox's
-own `pipewire-0` and `pulse/native` sockets.
+sandbox's runtime directory to `/run/user/<uid>`, so it should find the
+sandbox's own `pipewire-0` and `pulse/native` sockets there. This is not tested
+with a Steam game yet: the live audio test covers plain Wine only.
 
 ## Use
 
