@@ -273,9 +273,46 @@ def test_down_removes_the_state_directory(runtime):
     box.dir.mkdir()
     (box.dir / "hypr").mkdir()
     (box.dir / "nested.log").write_text("x")
+    (box.dir / "hypruse").mkdir()  # hypruse's own state goes too: its server is gone
+    (box.dir / "hypruse" / "state.json").write_text("{}")
     box.down()
     assert not box.dir.exists()
     assert box.lock.exists() and box.lock.parent == runtime  # never unlinked
+
+
+def _stale_dir_with_a_serving_hypruse(box):
+    box.dir.mkdir()
+    (box.dir / "hypr").mkdir()
+    (box.dir / "nested.log").write_text("old run")
+    (box.dir / "hypruse").mkdir()  # made by the MCP server's hypruse, before the sandbox
+    (box.dir / "hypruse" / "state.json").write_text('{"pid": 1}')
+
+
+@pytest.mark.parametrize("start_fails", [False, True])
+def test_up_leaves_the_serving_hypruse_state_alone(runtime, monkeypatch, start_fails):
+    # an MCP server starts hypruse before its sandbox, and hypruse makes
+    # <dir>/hypruse once, at startup, then rewrites state.json there on every
+    # acting call: a start that deleted it failed every launch, keyboard and
+    # pointer call after it with "No such file or directory: .../state.tmp"
+    box = hs.Sandbox("t")
+    _stale_dir_with_a_serving_hypruse(box)
+
+    def start(self, size, audio):
+        if start_fails:
+            raise hs.SandboxError("no GPU")
+
+    monkeypatch.setattr(hs.Sandbox, "healthy", lambda self: False)
+    monkeypatch.setattr(hs.Sandbox, "_stop_processes", lambda self: None)
+    monkeypatch.setattr(hs.Sandbox, "_start", start)
+    monkeypatch.setattr(hs.Sandbox, "status", lambda self: {})
+    if start_fails:
+        with pytest.raises(hs.SandboxError):
+            box.up()
+    else:
+        box.up()
+    assert (box.dir / "hypruse" / "state.json").read_text() == '{"pid": 1}'
+    assert not (box.dir / "nested.log").exists()  # the dead run's leftovers still go
+    assert not (box.dir / "hypr").exists()
 
 
 def test_up_and_mcp_make_the_state_directory_private(runtime):

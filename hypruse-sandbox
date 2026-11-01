@@ -68,6 +68,11 @@ SPECIAL = "hypruse"  # the parent's special workspace that holds every sandbox w
 TAG = "hypruse-sandbox"
 SIG_LINK = "sandbox"  # stable HYPRLAND_INSTANCE_SIGNATURE: a symlink to the real one
 WL_LINK = "wayland-sandbox"  # stable WAYLAND_DISPLAY, a symlink to the real socket
+# hypruse's own state directory (its server beacon, state.json). An MCP
+# server's hypruse makes it once, at startup, which is before its sandbox
+# exists, and rewrites state.json there on every acting call: starting the
+# sandbox must leave it alone. `down` still removes it with everything else.
+HYPRUSE_STATE = "hypruse"
 DEFAULT_SIZE = (1920, 1080)
 NAME_RE = re.compile(r"^[a-z0-9]{1,4}$")
 SUN_PATH_MAX = 107
@@ -386,13 +391,13 @@ class Sandbox:
                 return self.status()
             self._make_dir()
             self._stop_processes()  # a crashed run can leave its bus or apps behind
-            self._clean()
+            self._clean(keep=HYPRUSE_STATE)
             try:
                 self._start(size, audio)
             except BaseException:
                 # an error or a signal at any step: nothing half-started survives
                 self._stop_processes()
-                self._clean()
+                self._clean(keep=HYPRUSE_STATE)
                 raise
             return self.status()
 
@@ -438,8 +443,9 @@ class Sandbox:
         )
         self._wait_started()
 
-    def _clean(self) -> None:
-        """Remove what a dead instance left behind, keeping the directory."""
+    def _clean(self, keep: str = "") -> None:
+        """Remove what a dead instance left behind, keeping the directory
+        and the entry named `keep`."""
         if not self.dir.exists():
             return
         # a FUSE mount (the document portal mounts $XDG_RUNTIME_DIR/doc) survives
@@ -451,6 +457,8 @@ class Sandbox:
                 if point.startswith(prefix):
                     subprocess.run(["fusermount3", "-u", "-z", point], capture_output=True, timeout=5)
         for p in self.dir.iterdir():
+            if keep and p.name == keep:
+                continue
             if p.is_dir() and not p.is_symlink():
                 shutil.rmtree(p, ignore_errors=True)
             else:
