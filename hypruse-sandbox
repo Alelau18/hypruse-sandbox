@@ -68,11 +68,15 @@ SPECIAL = "hypruse"  # the parent's special workspace that holds every sandbox w
 TAG = "hypruse-sandbox"
 SIG_LINK = "sandbox"  # stable HYPRLAND_INSTANCE_SIGNATURE: a symlink to the real one
 WL_LINK = "wayland-sandbox"  # stable WAYLAND_DISPLAY, a symlink to the real socket
-# hypruse's own state directory (its server beacon, state.json). An MCP
-# server's hypruse makes it once, at startup, which is before its sandbox
-# exists, and rewrites state.json there on every acting call: starting the
-# sandbox must leave it alone. `down` still removes it with everything else.
+# hypruse's own state directory. Its server beacon (state.json, written
+# through state.tmp) belongs to the MCP server serving the sandbox, which
+# starts before the sandbox, outlives restarts of it, and rewrites the beacon
+# on every call but desktop and binds: starting the sandbox keeps it. The CLI
+# state beside it (cli-state-sandbox.json) is keyed by the instance
+# signature, which in a sandbox is always the symlink SIG_LINK, so it belongs
+# to the compositor that just died and goes. `down` removes everything.
 HYPRUSE_STATE = "hypruse"
+HYPRUSE_BEACON = ("state.json", "state.tmp")
 DEFAULT_SIZE = (1920, 1080)
 NAME_RE = re.compile(r"^[a-z0-9]{1,4}$")
 SUN_PATH_MAX = 107
@@ -391,13 +395,13 @@ class Sandbox:
                 return self.status()
             self._make_dir()
             self._stop_processes()  # a crashed run can leave its bus or apps behind
-            self._clean(keep=HYPRUSE_STATE)
+            self._clean(keep_beacon=True)
             try:
                 self._start(size, audio)
             except BaseException:
                 # an error or a signal at any step: nothing half-started survives
                 self._stop_processes()
-                self._clean(keep=HYPRUSE_STATE)
+                self._clean(keep_beacon=True)
                 raise
             return self.status()
 
@@ -443,9 +447,9 @@ class Sandbox:
         )
         self._wait_started()
 
-    def _clean(self, keep: str = "") -> None:
-        """Remove what a dead instance left behind, keeping the directory
-        and the entry named `keep`."""
+    def _clean(self, keep_beacon: bool = False) -> None:
+        """Remove what a dead instance left behind, keeping the directory and,
+        with keep_beacon, the beacon of the hypruse server serving it."""
         if not self.dir.exists():
             return
         # a FUSE mount (the document portal mounts $XDG_RUNTIME_DIR/doc) survives
@@ -456,13 +460,19 @@ class Sandbox:
                 point = line.split()[1].replace("\\040", " ")
                 if point.startswith(prefix):
                     subprocess.run(["fusermount3", "-u", "-z", point], capture_output=True, timeout=5)
-        for p in self.dir.iterdir():
-            if keep and p.name == keep:
-                continue
+        def remove(p: Path) -> None:
             if p.is_dir() and not p.is_symlink():
                 shutil.rmtree(p, ignore_errors=True)
             else:
                 p.unlink(missing_ok=True)
+
+        for p in self.dir.iterdir():
+            if keep_beacon and p.name == HYPRUSE_STATE and p.is_dir() and not p.is_symlink():
+                for q in p.iterdir():
+                    if q.name not in HYPRUSE_BEACON:
+                        remove(q)
+                continue
+            remove(p)
 
     def _start_bus(self) -> None:
         services = self.dir / "dbus-services"

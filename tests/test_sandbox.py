@@ -286,14 +286,19 @@ def _stale_dir_with_a_serving_hypruse(box):
     (box.dir / "nested.log").write_text("old run")
     (box.dir / "hypruse").mkdir()  # made by the MCP server's hypruse, before the sandbox
     (box.dir / "hypruse" / "state.json").write_text('{"pid": 1}')
+    (box.dir / "hypruse" / "state.tmp").write_text('{"pid": 1}')  # a write in flight
+    # keyed by the instance signature, which in a sandbox is always the
+    # symlink "sandbox": the dead compositor's marks, held button and seat
+    (box.dir / "hypruse" / "cli-state-sandbox.json").write_text('{"marking_installed": true}')
 
 
 @pytest.mark.parametrize("start_fails", [False, True])
-def test_up_leaves_the_serving_hypruse_state_alone(runtime, monkeypatch, start_fails):
+def test_up_keeps_only_the_serving_hypruse_beacon(runtime, monkeypatch, start_fails):
     # an MCP server starts hypruse before its sandbox, and hypruse makes
-    # <dir>/hypruse once, at startup, then rewrites state.json there on every
-    # acting call: a start that deleted it failed every launch, keyboard and
-    # pointer call after it with "No such file or directory: .../state.tmp"
+    # <dir>/hypruse once, at startup, then rewrites its beacon there on every
+    # call but desktop and binds: a start that deleted it failed all of those
+    # with "No such file or directory: .../state.tmp". The beacon is the
+    # server's and outlives the compositor; the CLI state beside it does not.
     box = hs.Sandbox("t")
     _stale_dir_with_a_serving_hypruse(box)
 
@@ -310,6 +315,7 @@ def test_up_leaves_the_serving_hypruse_state_alone(runtime, monkeypatch, start_f
             box.up()
     else:
         box.up()
+    assert sorted(p.name for p in (box.dir / "hypruse").iterdir()) == ["state.json", "state.tmp"]
     assert (box.dir / "hypruse" / "state.json").read_text() == '{"pid": 1}'
     assert not (box.dir / "nested.log").exists()  # the dead run's leftovers still go
     assert not (box.dir / "hypr").exists()
