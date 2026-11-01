@@ -4,7 +4,7 @@
 # release replaces it (pacman sees a higher version), dropping the fixes unless
 # they were merged upstream; rebuild from the rebased branch then.
 pkgname=hypruse
-pkgver=0.13.0.r79.g98ed81d
+pkgver=0.13.0.r81.g2e13a94
 pkgrel=1
 pkgdesc="Computer use for Hyprland (local fork: agent-ergonomics)"
 arch=('any')
